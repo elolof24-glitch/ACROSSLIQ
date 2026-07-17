@@ -1,12 +1,14 @@
-import { JsonRpcProvider, formatUnits, Interface } from 'ethers';
+import { JsonRpcProvider, formatUnits, Interface, id, zeroPadValue, getAddress } from 'ethers';
 
 // ---- Env + config ----
 
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+const ZERO_TOPIC = zeroPadValue(ZERO_ADDRESS, 32);
+
 const env = {
-  ARC_RPC_HTTP: process.env.ARC_RPC_HTTP || 'https://rpc.arc.network',
-  ARC_EXPLORER_BASE: process.env.ARC_EXPLORER_BASE || 'https://arcscan.app',
+  RPC_URL: process.env.RPC_URL || process.env.ARC_RPC_HTTP || 'https://rpc.arc.network',
   ARC_CHAIN_ID: Number(process.env.ARC_CHAIN_ID || '5042'),
-  ARC_USDC: process.env.ARC_USDC || '0x3600000000000000000000000000000000000000',
+  USDC_ADDRESS: process.env.USDC_ADDRESS || process.env.ARC_USDC || '0x3600000000000000000000000000000000000000',
 
   TARGET_WALLETS: splitCsv(
     process.env.TARGET_WALLETS ||
@@ -20,9 +22,11 @@ const env = {
 
   MIN_LIQUIDITY: BigInt(process.env.MIN_LIQUIDITY || '1'),
   POLL_INTERVAL_MS: Number(process.env.POLL_INTERVAL_MS || '4000'),
+  LOG_LOOKBACK_BLOCKS: Number(process.env.LOG_LOOKBACK_BLOCKS || '20'),
+  SUPPLY_ALERT_MIN_DELTA: BigInt(process.env.SUPPLY_ALERT_MIN_DELTA || '1'),
 
   DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL || '',
-  DISCORD_USERNAME: process.env.DISCORD_USERNAME || 'Arc LP Tracker',
+  DISCORD_USERNAME: process.env.DISCORD_USERNAME || 'Arc USDC Tracker',
   DISCORD_AVATAR_URL: process.env.DISCORD_AVATAR_URL || ''
 };
 
@@ -34,59 +38,73 @@ function short(addr) {
   return addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : 'n/a';
 }
 
+function safeAddr(addr) {
+  try {
+    return getAddress(addr);
+  } catch {
+    return addr;
+  }
+}
+
 if (!env.DISCORD_WEBHOOK_URL) {
   console.error('Missing DISCORD_WEBHOOK_URL');
   process.exit(1);
 }
 
-// ---- Providers & ABI ----
+// ---- Provider & ABI ----
 
-const provider = new JsonRpcProvider(env.ARC_RPC_HTTP, {
+const provider = new JsonRpcProvider(env.RPC_URL, {
   name: 'arc-mainnet',
   chainId: env.ARC_CHAIN_ID
 });
 
 const erc20 = new Interface([
-  'function balanceOf(address) view returns (uint256)'
+  'function balanceOf(address) view returns (uint256)',
+  'function totalSupply() view returns (uint256)',
+  'function decimals() view returns (uint8)',
+  'event Transfer(address indexed from, address indexed to, uint256 value)'
 ]);
 
-// per-target latest balance
-const state = new Map();
+const TRANSFER_TOPIC = id('Transfer(address,address,uint256)');
+
+const state = {
+  balances: new Map(),
+  totalSupply: null,
+  decimals: 6,
+  lastCheckedBlock: null,
+  seenLogs: new Set()
+};
+
 let discordBackoffUntil = 0;
 
-// ---- Core RPC helpers ----
+// ---- RPC helpers ----
 
 async function readUsdcBalance(address) {
   const data = erc20.encodeFunctionData('balanceOf', [address]);
-  const result = await provider.call({ to: env.ARC_USDC, data });
+  const result = await provider.call({ to: env.USDC_ADDRESS, data });
   const [balance] = erc20.decodeFunctionResult('balanceOf', result);
   return balance;
 }
 
-// ---- Explorer helper ----
-
-async function fetchExplorerTokenTx(address) {
-  try {
-    const url = new URL(`${env.ARC_EXPLORER_BASE}/api`);
-    url.searchParams.set('module', 'account');
-    url.searchParams.set('action', 'tokentx');
-    url.searchParams.set('contractaddress', env.ARC_USDC);
-    url.searchParams.set('address', address);
-    url.searchParams.set('sort', 'desc');
-
-    const res = await fetch(url, { headers: { accept: 'application/json' } });
-    if (!res.ok) return null;
-
-    const json = await res.json();
-    if (!json || !Array.isArray(json.result) || json.result.length === 0) return null;
-    return json.result[0];
-  } catch (err) {
-    console.error('fetchExplorerTokenTx error', address, err?.message || err);
-    return null;
-  }
+async function readTotalSupply() {
+  const data = erc20.encodeFunctionData('totalSupply', []);
+  const result = await provider.call({ to: env.USDC_ADDRESS, data });
+  const [supply] = erc20.decodeFunctionResult('totalSupply', result);
+  return supply;
 }
 
-// ---- Discord webhook ----
+async function readDecimals() {
+  const data = erc20.encodeFunctionData('decimals', []);
+  const result = await provider.call({ to: env.USDC_ADDRESS, data });
+  const [decimals] = erc20.decodeFunctionResult('decimals', result);
+  return Number(decimals);
+}
+
+function human(amount) {
+  return formatUnits(amount, state.decimals);
+}
+
+// ---- Discord ----
 
 async function sendDiscord(payload) {
   const now = Date.now();
@@ -116,56 +134,164 @@ async function sendDiscord(payload) {
   }
 }
 
-async function alertLiquidity(target, balance, previous, source, explorerTx = null) {
-  const human = formatUnits(balance, 6);
-  const prevHuman = previous === null ? '0' : formatUnits(previous, 6);
-  const delta = balance - (previous ?? 0n);
-  const deltaHuman = previous === null ? human : formatUnits(delta, 6);
-
-  const fields = [
-    { name: 'Target', value: `\`${target}\``, inline: false },
-    { name: 'Balance', value: `${human} USDC`, inline: true },
-    { name: 'Previous', value: `${prevHuman} USDC`, inline: true },
-    { name: 'Δ', value: `${deltaHuman} USDC`, inline: true },
-    { name: 'Source', value: source, inline: true }
-  ];
-
-  if (explorerTx?.hash) {
-    fields.push({
-      name: 'Last USDC tx',
-      value: `[${short(explorerTx.hash)}](${env.ARC_EXPLORER_BASE}/tx/${explorerTx.hash})`,
-      inline: false
-    });
-  }
+async function alertLiquidity(target, balance, previous) {
+  const prev = previous ?? 0n;
+  const delta = balance - prev;
 
   await sendDiscord({
     embeds: [
       {
         title: 'Arc USDC liquidity update',
-        description: `Balance change on monitored Arc target ${short(target)}.`,
+        description: `Balance change on monitored target ${short(target)}.`,
         color: 0x58a6ff,
-        fields,
+        fields: [
+          { name: 'Target', value: `\`${target}\``, inline: false },
+          { name: 'Balance', value: `${human(balance)} USDC`, inline: true },
+          { name: 'Previous', value: `${human(prev)} USDC`, inline: true },
+          { name: 'Δ', value: `${human(delta)} USDC`, inline: true }
+        ],
         timestamp: new Date().toISOString()
       }
     ]
   });
 }
 
-// ---- Tracking logic ----
+async function alertSupplyChange(current, previous) {
+  const delta = current - previous;
+  const color = delta >= 0n ? 0x22c55e : 0xef4444;
+
+  await sendDiscord({
+    embeds: [
+      {
+        title: 'Arc USDC supply changed',
+        description: `USDC total supply changed on chain ${env.ARC_CHAIN_ID}.`,
+        color,
+        fields: [
+          { name: 'Current', value: `${human(current)} USDC`, inline: true },
+          { name: 'Previous', value: `${human(previous)} USDC`, inline: true },
+          { name: 'Δ', value: `${human(delta)} USDC`, inline: true }
+        ],
+        timestamp: new Date().toISOString()
+      }
+    ]
+  });
+}
+
+async function alertMintOrBurn(kind, from, to, value, txHash, blockNumber) {
+  const isMint = kind === 'mint';
+
+  await sendDiscord({
+    embeds: [
+      {
+        title: isMint ? 'Arc USDC mint detected' : 'Arc USDC burn detected',
+        description: isMint
+          ? `USDC minted to ${short(to)}.`
+          : `USDC burned from ${short(from)}.`,
+        color: isMint ? 0x22c55e : 0xef4444,
+        fields: [
+          { name: 'Amount', value: `${human(value)} USDC`, inline: true },
+          { name: isMint ? 'To' : 'From', value: `\`${isMint ? to : from}\``, inline: false },
+          { name: 'Block', value: String(blockNumber), inline: true },
+          { name: 'Tx', value: `\`${txHash}\``, inline: false }
+        ],
+        timestamp: new Date().toISOString()
+      }
+    ]
+  });
+}
+
+// ---- Tracking ----
 
 async function checkTarget(target) {
   try {
     const balance = await readUsdcBalance(target);
-    const previous = state.has(target) ? state.get(target) : null;
+    const previous = state.balances.has(target) ? state.balances.get(target) : null;
     const changed = previous === null || balance !== previous;
-    state.set(target, balance);
+
+    state.balances.set(target, balance);
 
     if (balance >= env.MIN_LIQUIDITY && changed) {
-      const explorerTx = await fetchExplorerTokenTx(target);
-      await alertLiquidity(target, balance, previous, 'rpc+explorer', explorerTx);
+      await alertLiquidity(target, balance, previous);
     }
   } catch (err) {
     console.error('checkTarget error', target, err?.message || err);
+  }
+}
+
+async function checkSupply() {
+  try {
+    const current = await readTotalSupply();
+
+    if (state.totalSupply === null) {
+      state.totalSupply = current;
+      console.log('Initial USDC total supply:', human(current));
+      return;
+    }
+
+    const previous = state.totalSupply;
+    const deltaAbs = current >= previous ? current - previous : previous - current;
+
+    if (deltaAbs >= env.SUPPLY_ALERT_MIN_DELTA && current !== previous) {
+      await alertSupplyChange(current, previous);
+    }
+
+    state.totalSupply = current;
+  } catch (err) {
+    console.error('checkSupply error', err?.message || err);
+  }
+}
+
+async function checkMintBurnLogs() {
+  try {
+    const latest = await provider.getBlockNumber();
+
+    let fromBlock;
+    if (state.lastCheckedBlock === null) {
+      fromBlock = Math.max(0, latest - env.LOG_LOOKBACK_BLOCKS);
+    } else {
+      fromBlock = state.lastCheckedBlock + 1;
+    }
+
+    const toBlock = latest;
+    if (fromBlock > toBlock) return;
+
+    const logs = await provider.getLogs({
+      address: env.USDC_ADDRESS,
+      fromBlock,
+      toBlock,
+      topics: [TRANSFER_TOPIC]
+    });
+
+    for (const log of logs) {
+      const key = `${log.transactionHash}:${log.index}`;
+      if (state.seenLogs.has(key)) continue;
+      state.seenLogs.add(key);
+
+      let parsed;
+      try {
+        parsed = erc20.parseLog(log);
+      } catch {
+        continue;
+      }
+
+      const from = safeAddr(parsed.args.from);
+      const to = safeAddr(parsed.args.to);
+      const value = parsed.args.value;
+
+      if (from === ZERO_ADDRESS) {
+        await alertMintOrBurn('mint', from, to, value, log.transactionHash, log.blockNumber);
+      } else if (to === ZERO_ADDRESS) {
+        await alertMintOrBurn('burn', from, to, value, log.transactionHash, log.blockNumber);
+      }
+    }
+
+    if (state.seenLogs.size > 5000) {
+      state.seenLogs = new Set([...state.seenLogs].slice(-2000));
+    }
+
+    state.lastCheckedBlock = toBlock;
+  } catch (err) {
+    console.error('checkMintBurnLogs error', err?.message || err);
   }
 }
 
@@ -174,24 +300,29 @@ async function tick() {
 
   if (targets.length === 0) {
     console.log('No targets configured yet. Add TARGET_WALLETS or TARGET_CONTRACTS.');
-    return;
+  } else {
+    await Promise.all(targets.map(checkTarget));
   }
 
-  await Promise.all(targets.map(checkTarget));
+  await checkSupply();
+  await checkMintBurnLogs();
 }
 
 // ---- Boot ----
 
 async function boot() {
-  console.log('Starting Arc Discord tracker');
+  console.log('Starting Arc USDC tracker');
   console.log('Chain ID:', env.ARC_CHAIN_ID);
-  console.log('RPC:', env.ARC_RPC_HTTP);
-  console.log('Explorer:', env.ARC_EXPLORER_BASE);
+  console.log('RPC:', env.RPC_URL);
   console.log('Wallet targets:', env.TARGET_WALLETS.length);
   console.log('Contract targets:', env.TARGET_CONTRACTS.length);
 
+  state.decimals = await readDecimals();
+  state.totalSupply = await readTotalSupply();
+  state.lastCheckedBlock = await provider.getBlockNumber();
+
   await sendDiscord({
-    content: `Arc Discord tracker online on chain ${env.ARC_CHAIN_ID}. Monitoring ${env.TARGET_WALLETS.length + env.TARGET_CONTRACTS.length} targets.`
+    content: `Arc USDC tracker online on chain ${env.ARC_CHAIN_ID}. Monitoring ${env.TARGET_WALLETS.length + env.TARGET_CONTRACTS.length} targets. Current supply: ${human(state.totalSupply)} USDC.`
   });
 
   await tick();
